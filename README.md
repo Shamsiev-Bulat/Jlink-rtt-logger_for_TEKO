@@ -1,6 +1,4 @@
-# Jlink-rtt-logger_for_TEKO
-Cross-platform Python tool to automatically capture, timestamp, and save J-Link RTT logs with intelligent text filtering.
-# 📟 RTT Auto Logger
+# 📟 Jlink-rtt-logger_for_TEKO
 
 **Automated J-Link RTT Log Capture with Timestamps and Text Filtering**
 
@@ -16,7 +14,7 @@ A lightweight, cross-platform Python utility designed to seamlessly capture, tim
 - 📂 **Smart File Naming:** Automatically creates log files named with the exact date and time of launch (e.g., `RTT_log_2026-08-31_14-30-00.txt`).
 - 🧹 **Text Filtering:** Automatically strips out invisible control characters, null bytes, and ANSI escape sequences that often corrupt RTT logs.
 - 🔄 **Auto-Reconnect:** Keeps listening and automatically reconnects if the J-Link connection drops.
--  **Cross-Platform:** Works flawlessly on both Windows and Linux.
+- 🌍 **Cross-Platform:** Works flawlessly on both Windows and Linux.
 - 🚀 **One-Click Launch:** Includes ready-to-use Batch (Windows) and Bash (Linux) scripts to start the J-Link server and the logger simultaneously.
 
 ## 🛠️ Prerequisites
@@ -29,9 +27,74 @@ A lightweight, cross-platform Python utility designed to seamlessly capture, tim
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/your-username/rtt-auto-logger.git
-   cd rtt-auto-logger
+   git clone https://github.com/Shamsiev-Bulat/Jlink-rtt-logger_for_TEKO.git
+   cd Jlink-rtt-logger_for_TEKO
+   ```
 
+2. No external Python packages are required! The script uses only the Python Standard Library.
 
+## ⚙️ Usage
 
+### Basic Run
+Simply run the script. It will connect to the local J-Link server, start capturing logs, and save them to the current directory.
 
+```bash
+python rtt_auto_logger.py
+```
+
+### Command Line Arguments
+
+| Argument | Short | Description |
+|----------|-------|-------------|
+| `--directory` | `-d` | Specify a custom directory to save log files. |
+| `--host` | `-H` | J-Link server host (default: `localhost`). |
+| `--port` | `-p` | RTT Telnet port (default: `19021`). |
+| `--reconnect` | | Enable automatic reconnection if the connection drops. |
+| `--no-filter` | | Disable control character filtering (show raw data). |
+
+### Examples
+
+Save logs to a specific folder with auto-reconnect:
+```bash
+python rtt_auto_logger.py -d ./my_logs --reconnect
+```
+
+Connect to a remote J-Link server:
+```bash
+python rtt_auto_logger.py -H 192.168.1.100 -p 19022
+```
+
+### 🎯 One-Click Auto-Start (Recommended)
+
+To avoid launching the J-Link server and the Python logger separately, use the provided wrapper scripts. They start the J-Link GDB Server in the background, wait for it to initialize, and then launch the logger.
+
+**For Windows:**
+Run `start_rtt_logger.bat`. *(Make sure to update the J-Link path and device name inside the script if necessary).*
+
+**For Linux:**
+```bash
+chmod +x start_rtt_logger.sh
+./start_rtt_logger.sh
+```
+
+## 📊 Example Output
+
+**Console & File Output:**
+```
+[2026-08-31 14:30:05.123] System initialized successfully
+[2026-08-31 14:30:05.456] Sensor value: 42.5
+[2026-08-31 14:30:06.789] State changed: IDLE -> RUNNING
+```
+
+**Generated File Name:**
+```
+RTT_log_2026-08-31_14-30-00.txt
+```
+
+## 📜 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+---
+
+*Happy debugging! 🐛🔍*
