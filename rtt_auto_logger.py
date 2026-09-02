@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 RTT Auto Logger - Автоматическое чтение и сохранение логов J-Link RTT
-С функцией автоматической ротации логов по дням
+С функцией автоматической ротации логов по дням и умной буферизацией
 Работает на Windows и Linux
 """
 
@@ -10,21 +10,105 @@ import socket
 import time
 import argparse
 import sys
+import re
 from datetime import datetime
 from pathlib import Path
 
+class SmartBuffer:
+    """Умный буфер для обработки RTT данных"""
+    
+    def __init__(self):
+        self.buffer = bytearray()
+        self.line_patterns = [
+            b'\r\n',  # CRLF (наиболее распространённый)
+            b'\n',    # LF (Unix)
+            b'\r',    # CR (Mac/старые системы)
+        ]
+    
+    def append(self, data):
+        """Добавляет данные в буфер"""
+        self.buffer.extend(data)
+    
+    def get_complete_lines(self):
+        """
+        Извлекает все полные строки из буфера
+        Возвращает список строк и оставляет неполную строку в буфере
+        """
+        lines = []
+        
+        while len(self.buffer) > 0:
+            # Ищем ближайший разделитель строки
+            found_pos = None
+            found_pattern = None
+            
+            for pattern in self.line_patterns:
+                pos = self.buffer.find(pattern)
+                if pos != -1:
+                    if found_pos is None or pos < found_pos:
+                        found_pos = pos
+                        found_pattern = pattern
+            
+            if found_pos is not None:
+                # Извлекаем полную строку
+                line_bytes = self.buffer[:found_pos]
+                # Удаляем строку и разделитель из буфера
+                self.buffer = self.buffer[found_pos + len(found_pattern):]
+                
+                try:
+                    # Декодируем с заменой невалидных символов
+                    line = line_bytes.decode('utf-8', errors='replace')
+                    # Очищаем от управляющих символов (кроме пробелов)
+                    line = self._clean_line(line)
+                    if line:  # Добавляем только непустые строки
+                        lines.append(line)
+                except Exception as e:
+                    # Если не удалось декодировать, пропускаем
+                    print(f"[-] Ошибка декодирования строки: {e}")
+            else:
+                # Нет полных строк, выходим
+                break
+        
+        return lines
+    
+    def _clean_line(self, line):
+        """Очищает строку от управляющих символов"""
+        # Удаляем управляющие символы (кроме табуляции)
+        cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', line)
+        # Удаляем множественные пробелы в начале/конце
+        cleaned = cleaned.strip()
+        # Заменяем множественные пробелы внутри строки на один
+        cleaned = re.sub(r' {2,}', ' ', cleaned)
+        return cleaned
+    
+    def clear(self):
+        """Очищает буфер"""
+        self.buffer.clear()
+    
+    def __len__(self):
+        """Возвращает размер буфера"""
+        return len(self.buffer)
+
+
 class RTTAutoLogger:
     def __init__(self, host='localhost', rtt_port=19021, output_dir=None, 
-                 rotate_daily=True):
+                 rotate_daily=True, max_buffer_size=65536):
         self.host = host
         self.rtt_port = rtt_port
         self.output_dir = output_dir or Path.cwd()
         self.rotate_daily = rotate_daily
+        self.max_buffer_size = max_buffer_size
         self.running = False
         self.socket = None
         self.file_handle = None
         self.log_file = None
         self.current_date = None  # Отслеживаем текущую дату для ротации
+        self.smart_buffer = SmartBuffer()  # Умный буфер
+        self.stats = {
+            'bytes_received': 0,
+            'lines_processed': 0,
+            'incomplete_packets': 0,
+            'buffer_overflows': 0
+        }
         
     def get_timestamp(self):
         """Возвращает текущую временную метку"""
@@ -94,10 +178,10 @@ class RTTAutoLogger:
             return False
     
     def read_from_telnet(self):
-        """Чтение данных из Telnet соединения"""
-        buffer = b''
+        """Чтение данных из Telnet соединения с умной буферизацией"""
         line_count = 0
         last_rotation_check = time.time()
+        last_stats_print = time.time()
         
         while self.running:
             try:
@@ -107,16 +191,38 @@ class RTTAutoLogger:
                     self.check_and_rotate_log()
                     last_rotation_check = current_time
                 
+                # Выводим статистику каждые 30 секунд
+                if current_time - last_stats_print >= 30:
+                    self._print_stats()
+                    last_stats_print = current_time
+                
                 data = self.socket.recv(4096)
                 if data:
-                    buffer += data
-                    # Обрабатываем полные строки
-                    while b'\n' in buffer:
-                        line, buffer = buffer.split(b'\n', 1)
-                        line_str = line.decode('utf-8', errors='replace').strip()
-                        if line_str:
-                            self.process_line(line_str)
+                    self.stats['bytes_received'] += len(data)
+                    
+                    # Добавляем данные в умный буфер
+                    self.smart_buffer.append(data)
+                    
+                    # Проверяем переполнение буфера
+                    if len(self.smart_buffer) > self.max_buffer_size:
+                        self.stats['buffer_overflows'] += 1
+                        print(f"\n[!] Предупреждение: переполнение буфера ({len(self.smart_buffer)} байт)")
+                        # Очищаем буфер, чтобы избежать переполнения памяти
+                        self.smart_buffer.clear()
+                    
+                    # Извлекаем полные строки
+                    lines = self.smart_buffer.get_complete_lines()
+                    
+                    if lines:
+                        for line in lines:
+                            self.process_line(line)
                             line_count += 1
+                            self.stats['lines_processed'] += 1
+                    else:
+                        # Нет полных строк - возможно, пришёл неполный пакет
+                        if len(data) > 0 and len(self.smart_buffer) > 0:
+                            self.stats['incomplete_packets'] += 1
+                
                 time.sleep(0.01)
             except socket.timeout:
                 continue
@@ -128,6 +234,17 @@ class RTTAutoLogger:
                 break
         
         print(f"\n[*] Всего строк получено: {line_count}")
+        self._print_stats(final=True)
+    
+    def _print_stats(self, final=False):
+        """Выводит статистику работы"""
+        prefix = "[*] " if not final else "\n[*] ФИНАЛЬНАЯ "
+        print(f"{prefix}Статистика:")
+        print(f"    - Получено байт: {self.stats['bytes_received']:,}")
+        print(f"    - Обработано строк: {self.stats['lines_processed']:,}")
+        print(f"    - Неполных пакетов: {self.stats['incomplete_packets']:,}")
+        print(f"    - Переполнений буфера: {self.stats['buffer_overflows']:,}")
+        print(f"    - Размер буфера: {len(self.smart_buffer)} байт")
     
     def process_line(self, line):
         """Обработка строки лога с временной меткой"""
@@ -149,6 +266,12 @@ class RTTAutoLogger:
         """Запуск логгера"""
         self.running = True
         self.current_date = self.get_today_string()
+        self.stats = {
+            'bytes_received': 0,
+            'lines_processed': 0,
+            'incomplete_packets': 0,
+            'buffer_overflows': 0
+        }
         
         # Подключение к RTT
         if not self.connect_rtt_telnet():
@@ -162,6 +285,9 @@ class RTTAutoLogger:
         
         if self.rotate_daily:
             print(f"[*] Ежедневная ротация логов: ВКЛ")
+        
+        print(f"[*] Умный буфер (max {self.max_buffer_size} байт): ВКЛ")
+        print(f"[*] Поддержка LF/CR/CRLF: ВКЛ")
         
         print("\n" + "="*60)
         print("[*] Чтение RTT логов началось")
@@ -210,8 +336,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Примеры использования:
-  python rtt_auto_logger.py                    # С ежедневной ротацией
+  python rtt_auto_logger.py                    # С умной буферизацией и ротацией
   python rtt_auto_logger.py --no-rotation      # Без ротации (один файл)
+  python rtt_auto_logger.py --buffer-size 32768  # Изменить размер буфера
   python rtt_auto_logger.py -d ./logs          # Сохранение в папку ./logs
   python rtt_auto_logger.py -H 192.168.1.100   # Подключение к удалённому хосту
 
@@ -231,16 +358,19 @@ def main():
                        help='Автоматическое переподключение при обрыве')
     parser.add_argument('--no-rotation', action='store_true',
                        help='Отключить ежедневную ротацию (один файл на весь сеанс)')
+    parser.add_argument('--buffer-size', type=int, default=65536,
+                       help='Максимальный размер буфера в байтах (по умолчанию: 65536)')
     
     args = parser.parse_args()
     
     print("="*60)
-    print("RTT Auto Logger v2.0")
-    print("Автоматическое сохранение логов с временными метками")
+    print("RTT Auto Logger v2.1")
+    print("С умной буферизацией и ротацией логов")
     print("="*60)
     print(f"Хост: {args.host}")
     print(f"Порт RTT: {args.port}")
     print(f"Ротация логов: {'ОТКЛ' if args.no_rotation else 'ВКЛ (ежедневно)'}")
+    print(f"Размер буфера: {args.buffer_size:,} байт")
     if args.directory:
         print(f"Папка сохранения: {args.directory}")
     else:
@@ -270,7 +400,8 @@ def main():
         host=args.host,
         rtt_port=args.port,
         output_dir=output_dir,
-        rotate_daily=not args.no_rotation
+        rotate_daily=not args.no_rotation,
+        max_buffer_size=args.buffer_size
     )
     
     # Запуск с автопереподключением если нужно
@@ -289,7 +420,8 @@ def main():
                 host=args.host,
                 rtt_port=args.port,
                 output_dir=output_dir,
-                rotate_daily=not args.no_rotation
+                rotate_daily=not args.no_rotation,
+                max_buffer_size=args.buffer_size
             )
     else:
         logger.start()
