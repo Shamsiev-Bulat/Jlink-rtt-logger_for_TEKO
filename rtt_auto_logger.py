@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 RTT Auto Logger - Автоматическое чтение и сохранение логов J-Link RTT
-С функцией автоматической ротации логов по дням и умной буферизацией
+С функцией автоматической ротации логов, умной буферизацией и цветовым выделением
 Работает на Windows и Linux
 """
 
@@ -13,6 +13,99 @@ import sys
 import re
 from datetime import datetime
 from pathlib import Path
+
+# Опциональный импорт colorama для старых версий Windows
+try:
+    from colorama import init as colorama_init
+    colorama_init()
+    COLORAMA_AVAILABLE = True
+except ImportError:
+    COLORAMA_AVAILABLE = False
+
+
+class LogColorizer:
+    """Класс для цветового выделения логов в терминале"""
+    
+    # ANSI escape коды
+    RESET = '\033[0m'
+    BOLD = '\033[1m'
+    
+    # Цвета текста
+    RED = '\033[91m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    BLUE = '\033[94m'
+    MAGENTA = '\033[95m'
+    CYAN = '\033[96m'
+    WHITE = '\033[97m'
+    GRAY = '\033[90m'
+    
+    def __init__(self, enabled=True):
+        self.enabled = enabled
+        
+        # Паттерны для поиска ключевых слов (порядок важен!)
+        self.patterns = [
+            # Критические ошибки - красный
+            (re.compile(r'\b(ERROR|FATAL|CRITICAL|PANIC|FAIL(?:URE)?|EXCEPTION)\b', re.IGNORECASE), self.RED),
+            # Предупреждения - желтый
+            (re.compile(r'\b(WARN(?:ING)?)\b', re.IGNORECASE), self.YELLOW),
+            # Успешные состояния - зеленый
+            (re.compile(r'\b(INFO|OK|SUCCESS|GOOD|READY|PASS|RELEASE)\b', re.IGNORECASE), self.GREEN),
+            # Отладочная информация - серый
+            (re.compile(r'\b(DEBUG|TRACE)\b', re.IGNORECASE), self.GRAY),
+            # Состояния вкл/выкл - голубой
+            (re.compile(r'\b(ON|OFF|ENABLE|DISABLE|START|STOP)\b', re.IGNORECASE), self.CYAN),
+            # Важные события - фиолетовый
+            (re.compile(r'\b(CHANGED|TRANSITION|SWITCH)\b', re.IGNORECASE), self.MAGENTA),
+            # Числовые значения в контексте (adXXX:YYYYY) - белый жирный
+            (re.compile(r'(ad[A-Z0-9]+:\d+)', re.IGNORECASE), self.BOLD + self.WHITE),
+        ]
+        
+        # Паттерн для временной метки [YYYY-MM-DD HH:MM:SS.mmm]
+        self.timestamp_pattern = re.compile(r'(\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\])')
+    
+    def colorize(self, line):
+        """Применяет цветовое выделение к строке лога"""
+        if not self.enabled:
+            return line
+        
+        colored = line
+        
+        # Сначала красим временную метку (если есть)
+        colored = self.timestamp_pattern.sub(
+            f'{self.CYAN}\\1{self.RESET}',
+            colored
+        )
+        
+        # Применяем паттерны ключевых слов
+        for pattern, color in self.patterns:
+            colored = pattern.sub(
+                f'{color}\\1{self.RESET}' if '\\1' in pattern.pattern else f'{color}\\g<0>{self.RESET}',
+                colored
+            )
+        
+        return colored
+    
+    def colorize_level(self, line, level='INFO'):
+        """Альтернативный метод - красит всю строку в цвет уровня"""
+        if not self.enabled:
+            return line
+        
+        level_colors = {
+            'ERROR': self.RED,
+            'FATAL': self.RED,
+            'CRITICAL': self.RED + self.BOLD,
+            'PANIC': self.RED + self.BOLD,
+            'WARN': self.YELLOW,
+            'WARNING': self.YELLOW,
+            'INFO': self.GREEN,
+            'DEBUG': self.GRAY,
+            'TRACE': self.GRAY,
+        }
+        
+        color = level_colors.get(level.upper(), self.WHITE)
+        return f'{color}{line}{self.RESET}'
+
 
 class SmartBuffer:
     """Умный буфер для обработки RTT данных"""
@@ -91,7 +184,7 @@ class SmartBuffer:
 
 class RTTAutoLogger:
     def __init__(self, host='localhost', rtt_port=19021, output_dir=None, 
-                 rotate_daily=True, max_buffer_size=65536):
+                 rotate_daily=True, max_buffer_size=65536, color_enabled=True):
         self.host = host
         self.rtt_port = rtt_port
         self.output_dir = output_dir or Path.cwd()
@@ -103,6 +196,7 @@ class RTTAutoLogger:
         self.log_file = None
         self.current_date = None  # Отслеживаем текущую дату для ротации
         self.smart_buffer = SmartBuffer()  # Умный буфер
+        self.colorizer = LogColorizer(enabled=color_enabled)  # Цветовое выделение
         self.stats = {
             'bytes_received': 0,
             'lines_processed': 0,
@@ -247,14 +341,15 @@ class RTTAutoLogger:
         print(f"    - Размер буфера: {len(self.smart_buffer)} байт")
     
     def process_line(self, line):
-        """Обработка строки лога с временной меткой"""
+        """Обработка строки лога с временной меткой и цветовым выделением"""
         timestamp = self.get_timestamp()
         timestamped_line = f"[{timestamp}] {line}"
         
-        # Вывод в консоль
-        print(timestamped_line)
+        # Вывод в консоль С ЦВЕТАМИ
+        colored_line = self.colorizer.colorize(timestamped_line)
+        print(colored_line)
         
-        # Запись в файл
+        # Запись в файл БЕЗ цветов (чистый текст)
         if self.file_handle:
             try:
                 self.file_handle.write(timestamped_line + '\n')
@@ -288,6 +383,7 @@ class RTTAutoLogger:
         
         print(f"[*] Умный буфер (max {self.max_buffer_size} байт): ВКЛ")
         print(f"[*] Поддержка LF/CR/CRLF: ВКЛ")
+        print(f"[*] Цветовое выделение: {'ВКЛ' if self.colorizer.enabled else 'ОТКЛ'}")
         
         print("\n" + "="*60)
         print("[*] Чтение RTT логов началось")
@@ -319,6 +415,7 @@ class RTTAutoLogger:
                 pass
         print("[*] RTT Logger остановлен")
 
+
 def check_jlink_running(host='localhost', port=19021):
     """Проверка, запущен ли JLink сервер"""
     try:
@@ -330,17 +427,28 @@ def check_jlink_running(host='localhost', port=19021):
     except:
         return False
 
+
 def main():
     parser = argparse.ArgumentParser(
         description='RTT Auto Logger - Автоматическое сохранение логов J-Link RTT',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Примеры использования:
-  python rtt_auto_logger.py                    # С умной буферизацией и ротацией
-  python rtt_auto_logger.py --no-rotation      # Без ротации (один файл)
-  python rtt_auto_logger.py --buffer-size 32768  # Изменить размер буфера
-  python rtt_auto_logger.py -d ./logs          # Сохранение в папку ./logs
-  python rtt_auto_logger.py -H 192.168.1.100   # Подключение к удалённому хосту
+  python rtt_auto_logger.py                         # С цветами, буферизацией и ротацией
+  python rtt_auto_logger.py --no-color              # Без цветового выделения
+  python rtt_auto_logger.py --no-rotation           # Без ротации (один файл)
+  python rtt_auto_logger.py --buffer-size 32768     # Изменить размер буфера
+  python rtt_auto_logger.py -d ./logs               # Сохранение в папку ./logs
+  python rtt_auto_logger.py -H 192.168.1.100        # Подключение к удалённому хосту
+
+Цветовое выделение:
+  - Красный:   ERROR, FATAL, CRITICAL, PANIC, FAIL
+  - Желтый:    WARN, WARNING
+  - Зеленый:   INFO, OK, SUCCESS, GOOD, READY
+  - Серый:     DEBUG, TRACE
+  - Голубой:   ON, OFF, ENABLE, DISABLE
+  - Фиолетовый: CHANGED, TRANSITION, SWITCH
+  - Циан:      Временные метки
 
 Имя файла будет создано автоматически в формате:
   RTT_log_2026-01-15.txt (с ежедневной ротацией)
@@ -360,17 +468,20 @@ def main():
                        help='Отключить ежедневную ротацию (один файл на весь сеанс)')
     parser.add_argument('--buffer-size', type=int, default=65536,
                        help='Максимальный размер буфера в байтах (по умолчанию: 65536)')
+    parser.add_argument('--no-color', action='store_true',
+                       help='Отключить цветовое выделение в консоли')
     
     args = parser.parse_args()
     
     print("="*60)
-    print("RTT Auto Logger v2.1")
-    print("С умной буферизацией и ротацией логов")
+    print("RTT Auto Logger v2.2")
+    print("С цветовой подсветкой, буферизацией и ротацией логов")
     print("="*60)
     print(f"Хост: {args.host}")
     print(f"Порт RTT: {args.port}")
     print(f"Ротация логов: {'ОТКЛ' if args.no_rotation else 'ВКЛ (ежедневно)'}")
     print(f"Размер буфера: {args.buffer_size:,} байт")
+    print(f"Цветовое выделение: {'ОТКЛ' if args.no_color else 'ВКЛ'}")
     if args.directory:
         print(f"Папка сохранения: {args.directory}")
     else:
@@ -401,7 +512,8 @@ def main():
         rtt_port=args.port,
         output_dir=output_dir,
         rotate_daily=not args.no_rotation,
-        max_buffer_size=args.buffer_size
+        max_buffer_size=args.buffer_size,
+        color_enabled=not args.no_color
     )
     
     # Запуск с автопереподключением если нужно
@@ -421,10 +533,12 @@ def main():
                 rtt_port=args.port,
                 output_dir=output_dir,
                 rotate_daily=not args.no_rotation,
-                max_buffer_size=args.buffer_size
+                max_buffer_size=args.buffer_size,
+                color_enabled=not args.no_color
             )
     else:
         logger.start()
+
 
 if __name__ == '__main__':
     main()
