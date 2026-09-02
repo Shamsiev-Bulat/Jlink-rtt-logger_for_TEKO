@@ -1,110 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-RTT Auto Logger - Автоматическое чтение и сохранение логов J-Link RTT
-С функцией автоматической ротации логов, умной буферизацией и цветовым выделением
-Работает на Windows и Linux
+RTT Auto Logger GUI - Графический интерфейс для чтения логов J-Link RTT
+Современный интерфейс с цветовым выделением и всеми функциями
 """
 
+import customtkinter as ctk
+from tkinter import scrolledtext, messagebox
 import socket
+import threading
 import time
-import argparse
-import sys
 import re
 from datetime import datetime
 from pathlib import Path
+import sys
+import os
 
-# Опциональный импорт colorama для старых версий Windows
-try:
-    from colorama import init as colorama_init
-    colorama_init()
-    COLORAMA_AVAILABLE = True
-except ImportError:
-    COLORAMA_AVAILABLE = False
-
-
-class LogColorizer:
-    """Класс для цветового выделения логов в терминале"""
-    
-    # ANSI escape коды
-    RESET = '\033[0m'
-    BOLD = '\033[1m'
-    
-    # Цвета текста
-    RED = '\033[91m'
-    GREEN = '\033[92m'
-    YELLOW = '\033[93m'
-    BLUE = '\033[94m'
-    MAGENTA = '\033[95m'
-    CYAN = '\033[96m'
-    WHITE = '\033[97m'
-    GRAY = '\033[90m'
-    
-    def __init__(self, enabled=True):
-        self.enabled = enabled
-        
-        # Паттерны для поиска ключевых слов (порядок важен!)
-        self.patterns = [
-            # Критические ошибки - красный
-            (re.compile(r'\b(ERROR|FATAL|CRITICAL|PANIC|FAIL(?:URE)?|EXCEPTION)\b', re.IGNORECASE), self.RED),
-            # Предупреждения - желтый
-            (re.compile(r'\b(WARN(?:ING)?)\b', re.IGNORECASE), self.YELLOW),
-            # Успешные состояния - зеленый
-            (re.compile(r'\b(INFO|OK|SUCCESS|GOOD|READY|PASS|RELEASE)\b', re.IGNORECASE), self.GREEN),
-            # Отладочная информация - серый
-            (re.compile(r'\b(DEBUG|TRACE)\b', re.IGNORECASE), self.GRAY),
-            # Состояния вкл/выкл - голубой
-            (re.compile(r'\b(ON|OFF|ENABLE|DISABLE|START|STOP)\b', re.IGNORECASE), self.CYAN),
-            # Важные события - фиолетовый
-            (re.compile(r'\b(CHANGED|TRANSITION|SWITCH)\b', re.IGNORECASE), self.MAGENTA),
-            # Числовые значения в контексте (adXXX:YYYYY) - белый жирный
-            (re.compile(r'(ad[A-Z0-9]+:\d+)', re.IGNORECASE), self.BOLD + self.WHITE),
-        ]
-        
-        # Паттерн для временной метки [YYYY-MM-DD HH:MM:SS.mmm]
-        self.timestamp_pattern = re.compile(r'(\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\])')
-    
-    def colorize(self, line):
-        """Применяет цветовое выделение к строке лога"""
-        if not self.enabled:
-            return line
-        
-        colored = line
-        
-        # Сначала красим временную метку (если есть)
-        colored = self.timestamp_pattern.sub(
-            f'{self.CYAN}\\1{self.RESET}',
-            colored
-        )
-        
-        # Применяем паттерны ключевых слов
-        for pattern, color in self.patterns:
-            colored = pattern.sub(
-                f'{color}\\1{self.RESET}' if '\\1' in pattern.pattern else f'{color}\\g<0>{self.RESET}',
-                colored
-            )
-        
-        return colored
-    
-    def colorize_level(self, line, level='INFO'):
-        """Альтернативный метод - красит всю строку в цвет уровня"""
-        if not self.enabled:
-            return line
-        
-        level_colors = {
-            'ERROR': self.RED,
-            'FATAL': self.RED,
-            'CRITICAL': self.RED + self.BOLD,
-            'PANIC': self.RED + self.BOLD,
-            'WARN': self.YELLOW,
-            'WARNING': self.YELLOW,
-            'INFO': self.GREEN,
-            'DEBUG': self.GRAY,
-            'TRACE': self.GRAY,
-        }
-        
-        color = level_colors.get(level.upper(), self.WHITE)
-        return f'{color}{line}{self.RESET}'
+# Настройка темы
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
 
 
 class SmartBuffer:
@@ -112,25 +26,14 @@ class SmartBuffer:
     
     def __init__(self):
         self.buffer = bytearray()
-        self.line_patterns = [
-            b'\r\n',  # CRLF (наиболее распространённый)
-            b'\n',    # LF (Unix)
-            b'\r',    # CR (Mac/старые системы)
-        ]
+        self.line_patterns = [b'\r\n', b'\n', b'\r']
     
     def append(self, data):
-        """Добавляет данные в буфер"""
         self.buffer.extend(data)
     
     def get_complete_lines(self):
-        """
-        Извлекает все полные строки из буфера
-        Возвращает список строк и оставляет неполную строку в буфере
-        """
         lines = []
-        
         while len(self.buffer) > 0:
-            # Ищем ближайший разделитель строки
             found_pos = None
             found_pattern = None
             
@@ -142,403 +45,490 @@ class SmartBuffer:
                         found_pattern = pattern
             
             if found_pos is not None:
-                # Извлекаем полную строку
                 line_bytes = self.buffer[:found_pos]
-                # Удаляем строку и разделитель из буфера
                 self.buffer = self.buffer[found_pos + len(found_pattern):]
                 
                 try:
-                    # Декодируем с заменой невалидных символов
                     line = line_bytes.decode('utf-8', errors='replace')
-                    # Очищаем от управляющих символов (кроме пробелов)
                     line = self._clean_line(line)
-                    if line:  # Добавляем только непустые строки
+                    if line:
                         lines.append(line)
-                except Exception as e:
-                    # Если не удалось декодировать, пропускаем
-                    print(f"[-] Ошибка декодирования строки: {e}")
+                except:
+                    pass
             else:
-                # Нет полных строк, выходим
                 break
         
         return lines
     
     def _clean_line(self, line):
-        """Очищает строку от управляющих символов"""
-        # Удаляем управляющие символы (кроме табуляции)
         cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', line)
-        # Удаляем множественные пробелы в начале/конце
         cleaned = cleaned.strip()
-        # Заменяем множественные пробелы внутри строки на один
         cleaned = re.sub(r' {2,}', ' ', cleaned)
         return cleaned
     
     def clear(self):
-        """Очищает буфер"""
         self.buffer.clear()
     
     def __len__(self):
-        """Возвращает размер буфера"""
         return len(self.buffer)
 
 
-class RTTAutoLogger:
-    def __init__(self, host='localhost', rtt_port=19021, output_dir=None, 
-                 rotate_daily=True, max_buffer_size=65536, color_enabled=True):
+class RTTLoggerThread(threading.Thread):
+    """Поток для подключения к RTT"""
+    
+    def __init__(self, host, port, callback, stop_event):
+        super().__init__()
         self.host = host
-        self.rtt_port = rtt_port
-        self.output_dir = output_dir or Path.cwd()
-        self.rotate_daily = rotate_daily
-        self.max_buffer_size = max_buffer_size
-        self.running = False
+        self.port = port
+        self.callback = callback
+        self.stop_event = stop_event
         self.socket = None
-        self.file_handle = None
-        self.log_file = None
-        self.current_date = None  # Отслеживаем текущую дату для ротации
-        self.smart_buffer = SmartBuffer()  # Умный буфер
-        self.colorizer = LogColorizer(enabled=color_enabled)  # Цветовое выделение
+        self.running = False
         self.stats = {
             'bytes_received': 0,
-            'lines_processed': 0,
-            'incomplete_packets': 0,
-            'buffer_overflows': 0
+            'lines_processed': 0
         }
-        
-    def get_timestamp(self):
-        """Возвращает текущую временную метку"""
-        return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     
-    def get_today_string(self):
-        """Возвращает строку с текущей датой (YYYY-MM-DD)"""
-        return datetime.now().strftime("%Y-%m-%d")
-    
-    def create_log_filename(self):
-        """Создаёт имя файла с датой и временем запуска"""
-        now = datetime.now()
-        date_str = now.strftime("%Y-%m-%d")
-        time_str = now.strftime("%H-%M-%S")
-        
-        if self.rotate_daily:
-            # При ежедневной ротации имя файла содержит только дату
-            filename = f"RTT_log_{date_str}.txt"
-        else:
-            # Без ротации - дата и время запуска
-            filename = f"RTT_log_{date_str}_{time_str}.txt"
-        
-        return Path(self.output_dir) / filename
-    
-    def check_and_rotate_log(self):
-        """Проверяет, не сменился ли день, и создаёт новый файл при необходимости"""
-        if not self.rotate_daily:
-            return
-        
-        today = self.get_today_string()
-        
-        # Если дата изменилась, закрываем старый файл и создаём новый
-        if self.current_date != today:
-            if self.file_handle:
-                try:
-                    old_file = self.log_file
-                    self.file_handle.close()
-                    print(f"\n[✓] Предыдущий лог сохранён: {old_file}")
-                except Exception as e:
-                    print(f"[-] Ошибка при закрытии файла: {e}")
-            
-            self.current_date = today
-            self.open_log_file()
-    
-    def connect_rtt_telnet(self):
-        """Подключение к RTT через Telnet (порт 19021)"""
+    def run(self):
         try:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.settimeout(2.0)
-            self.socket.connect((self.host, self.rtt_port))
+            self.socket.connect((self.host, self.port))
             self.socket.setblocking(0)
-            print(f"[+] Подключено к RTT через Telnet порт {self.rtt_port}")
-            return True
-        except Exception as e:
-            print(f"[-] Ошибка подключения к RTT Telnet: {e}")
-            return False
-    
-    def open_log_file(self):
-        """Открывает файл лога с автоматическим именем"""
-        self.log_file = self.create_log_filename()
-        try:
-            self.file_handle = open(self.log_file, 'a', encoding='utf-8')
-            print(f"[+] Файл лога: {self.log_file}")
-            return True
-        except Exception as e:
-            print(f"[-] Ошибка создания файла: {e}")
-            return False
-    
-    def read_from_telnet(self):
-        """Чтение данных из Telnet соединения с умной буферизацией"""
-        line_count = 0
-        last_rotation_check = time.time()
-        last_stats_print = time.time()
-        
-        while self.running:
-            try:
-                # Проверяем необходимость ротации каждые 60 секунд
-                current_time = time.time()
-                if current_time - last_rotation_check >= 60:
-                    self.check_and_rotate_log()
-                    last_rotation_check = current_time
-                
-                # Выводим статистику каждые 30 секунд
-                if current_time - last_stats_print >= 30:
-                    self._print_stats()
-                    last_stats_print = current_time
-                
-                data = self.socket.recv(4096)
-                if data:
-                    self.stats['bytes_received'] += len(data)
-                    
-                    # Добавляем данные в умный буфер
-                    self.smart_buffer.append(data)
-                    
-                    # Проверяем переполнение буфера
-                    if len(self.smart_buffer) > self.max_buffer_size:
-                        self.stats['buffer_overflows'] += 1
-                        print(f"\n[!] Предупреждение: переполнение буфера ({len(self.smart_buffer)} байт)")
-                        # Очищаем буфер, чтобы избежать переполнения памяти
-                        self.smart_buffer.clear()
-                    
-                    # Извлекаем полные строки
-                    lines = self.smart_buffer.get_complete_lines()
-                    
-                    if lines:
+            self.running = True
+            
+            buffer = SmartBuffer()
+            
+            while not self.stop_event.is_set():
+                try:
+                    data = self.socket.recv(4096)
+                    if data:
+                        self.stats['bytes_received'] += len(data)
+                        buffer.append(data)
+                        lines = buffer.get_complete_lines()
+                        
                         for line in lines:
-                            self.process_line(line)
-                            line_count += 1
+                            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                            timestamped_line = f"[{timestamp}] {line}"
+                            self.callback(timestamped_line)
                             self.stats['lines_processed'] += 1
-                    else:
-                        # Нет полных строк - возможно, пришёл неполный пакет
-                        if len(data) > 0 and len(self.smart_buffer) > 0:
-                            self.stats['incomplete_packets'] += 1
-                
-                time.sleep(0.01)
-            except socket.timeout:
-                continue
-            except BlockingIOError:
-                time.sleep(0.01)
-            except Exception as e:
-                if self.running:
-                    print(f"[-] Ошибка чтения: {e}")
-                break
-        
-        print(f"\n[*] Всего строк получено: {line_count}")
-        self._print_stats(final=True)
-    
-    def _print_stats(self, final=False):
-        """Выводит статистику работы"""
-        prefix = "[*] " if not final else "\n[*] ФИНАЛЬНАЯ "
-        print(f"{prefix}Статистика:")
-        print(f"    - Получено байт: {self.stats['bytes_received']:,}")
-        print(f"    - Обработано строк: {self.stats['lines_processed']:,}")
-        print(f"    - Неполных пакетов: {self.stats['incomplete_packets']:,}")
-        print(f"    - Переполнений буфера: {self.stats['buffer_overflows']:,}")
-        print(f"    - Размер буфера: {len(self.smart_buffer)} байт")
-    
-    def process_line(self, line):
-        """Обработка строки лога с временной меткой и цветовым выделением"""
-        timestamp = self.get_timestamp()
-        timestamped_line = f"[{timestamp}] {line}"
-        
-        # Вывод в консоль С ЦВЕТАМИ
-        colored_line = self.colorizer.colorize(timestamped_line)
-        print(colored_line)
-        
-        # Запись в файл БЕЗ цветов (чистый текст)
-        if self.file_handle:
-            try:
-                self.file_handle.write(timestamped_line + '\n')
-                self.file_handle.flush()  # Гарантируем запись на диск
-            except Exception as e:
-                print(f"[-] Ошибка записи в файл: {e}")
-    
-    def start(self):
-        """Запуск логгера"""
-        self.running = True
-        self.current_date = self.get_today_string()
-        self.stats = {
-            'bytes_received': 0,
-            'lines_processed': 0,
-            'incomplete_packets': 0,
-            'buffer_overflows': 0
-        }
-        
-        # Подключение к RTT
-        if not self.connect_rtt_telnet():
-            print("[-] Не удалось подключиться к RTT.")
-            print("[!] Убедитесь, что JLinkGDBServer запущен.")
-            return False
-        
-        # Создание файла лога
-        if not self.open_log_file():
-            return False
-        
-        if self.rotate_daily:
-            print(f"[*] Ежедневная ротация логов: ВКЛ")
-        
-        print(f"[*] Умный буфер (max {self.max_buffer_size} байт): ВКЛ")
-        print(f"[*] Поддержка LF/CR/CRLF: ВКЛ")
-        print(f"[*] Цветовое выделение: {'ВКЛ' if self.colorizer.enabled else 'ОТКЛ'}")
-        
-        print("\n" + "="*60)
-        print("[*] Чтение RTT логов началось")
-        print("[*] Нажмите Ctrl+C для остановки")
-        print("="*60 + "\n")
-        
-        try:
-            self.read_from_telnet()
-        except KeyboardInterrupt:
-            print("\n[*] Остановка по команде пользователя")
+                    
+                    time.sleep(0.01)
+                except socket.timeout:
+                    continue
+                except BlockingIOError:
+                    time.sleep(0.01)
+                except Exception as e:
+                    if self.running:
+                        self.callback(f"[ERROR] {str(e)}", level='error')
+                    break
+                    
+        except Exception as e:
+            self.callback(f"[ERROR] Не удалось подключиться: {str(e)}", level='error')
         finally:
-            self.stop()
-        
-        return True
+            self.running = False
+            if self.socket:
+                try:
+                    self.socket.close()
+                except:
+                    pass
     
     def stop(self):
-        """Остановка логгера"""
         self.running = False
         if self.socket:
             try:
                 self.socket.close()
             except:
                 pass
-        if self.file_handle:
+
+
+class RTTLoggerGUI(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        
+        # Настройка окна
+        self.title("J-Link RTT Auto Logger v3.0")
+        self.geometry("1200x700")
+        
+        # Переменные
+        self.is_connected = False
+        self.logger_thread = None
+        self.stop_event = threading.Event()
+        self.log_file = None
+        self.auto_save = True
+        self.current_date = None
+        
+        # Цвета для уровней логов
+        self.level_colors = {
+            'error': '#FF6B6B',      # Красный
+            'warn': '#FFD93D',       # Желтый
+            'info': '#6BCF7F',       # Зеленый
+            'debug': '#A0A0A0',      # Серый
+            'default': '#FFFFFF'     # Белый
+        }
+        
+        # Создание интерфейса
+        self._create_widgets()
+        self._create_menu()
+        
+        # Обработчик закрытия
+        self.protocol("WM_DELETE_WINDOW", self._on_closing)
+    
+    def _create_widgets(self):
+        """Создание виджетов интерфейса"""
+        
+        # === Панель управления (сверху) ===
+        self.control_frame = ctk.CTkFrame(self)
+        self.control_frame.pack(fill="x", padx=10, pady=10)
+        
+        # Хост и порт
+        ctk.CTkLabel(self.control_frame, text="Хост:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
+        self.host_entry = ctk.CTkEntry(self.control_frame, width=150)
+        self.host_entry.grid(row=0, column=1, padx=5, pady=5)
+        self.host_entry.insert(0, "localhost")
+        
+        ctk.CTkLabel(self.control_frame, text="Порт:").grid(row=0, column=2, padx=5, pady=5, sticky="e")
+        self.port_entry = ctk.CTkEntry(self.control_frame, width=80)
+        self.port_entry.grid(row=0, column=3, padx=5, pady=5)
+        self.port_entry.insert(0, "19021")
+        
+        # Папка для логов
+        ctk.CTkLabel(self.control_frame, text="Папка:").grid(row=0, column=4, padx=5, pady=5, sticky="e")
+        self.folder_entry = ctk.CTkEntry(self.control_frame, width=200)
+        self.folder_entry.grid(row=0, column=5, padx=5, pady=5)
+        self.folder_entry.insert(0, str(Path.cwd()))
+        
+        self.browse_btn = ctk.CTkButton(self.control_frame, text="...", width=30, command=self._browse_folder)
+        self.browse_btn.grid(row=0, column=6, padx=5, pady=5)
+        
+        # Опции
+        self.rotation_var = ctk.BooleanVar(value=True)
+        self.rotation_check = ctk.CTkCheckBox(self.control_frame, text="Ротация по дням", 
+                                               variable=self.rotation_var)
+        self.rotation_check.grid(row=1, column=0, columnspan=2, padx=5, pady=5, sticky="w")
+        
+        self.autosave_var = ctk.BooleanVar(value=True)
+        self.autosave_check = ctk.CTkCheckBox(self.control_frame, text="Автосохранение", 
+                                               variable=self.autosave_var)
+        self.autosave_check.grid(row=1, column=2, columnspan=2, padx=5, pady=5, sticky="w")
+        
+        # Кнопки управления
+        self.connect_btn = ctk.CTkButton(self.control_frame, text="Подключиться", 
+                                          command=self._toggle_connection, 
+                                          fg_color="#2ECC71", width=120)
+        self.connect_btn.grid(row=1, column=4, columnspan=2, padx=10, pady=5)
+        
+        self.clear_btn = ctk.CTkButton(self.control_frame, text="Очистить", 
+                                        command=self._clear_logs, 
+                                        fg_color="#E74C3C", width=100)
+        self.clear_btn.grid(row=1, column=6, padx=5, pady=5)
+        
+        # === Статус бар ===
+        self.status_frame = ctk.CTkFrame(self)
+        self.status_frame.pack(fill="x", padx=10, pady=(0, 10))
+        
+        self.status_label = ctk.CTkLabel(self.status_frame, text="Статус: Отключено", 
+                                          text_color="#95A5A6")
+        self.status_label.pack(side="left", padx=10, pady=5)
+        
+        self.stats_label = ctk.CTkLabel(self.status_frame, text="Байт: 0 | Строк: 0", 
+                                         text_color="#95A5A6")
+        self.stats_label.pack(side="right", padx=10, pady=5)
+        
+        # === Область логов ===
+        self.log_frame = ctk.CTkFrame(self)
+        self.log_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        
+        # Текстовое поле с логами
+        self.log_text = scrolledtext.ScrolledText(self.log_frame, wrap="word", 
+                                                   bg="#1E1E1E", fg="#FFFFFF",
+                                                   font=("Consolas", 10),
+                                                   relief="flat")
+        self.log_text.pack(fill="both", expand=True, padx=5, pady=5)
+        
+        # Настройка тегов для цветов
+        self.log_text.tag_config('error', foreground=self.level_colors['error'])
+        self.log_text.tag_config('warn', foreground=self.level_colors['warn'])
+        self.log_text.tag_config('info', foreground=self.level_colors['info'])
+        self.log_text.tag_config('debug', foreground=self.level_colors['debug'])
+        self.log_text.tag_config('timestamp', foreground="#4ECDC4")
+        
+        # === Фильтр ===
+        self.filter_frame = ctk.CTkFrame(self)
+        self.filter_frame.pack(fill="x", padx=10, pady=(0, 10))
+        
+        ctk.CTkLabel(self.filter_frame, text="Фильтр:").pack(side="left", padx=5)
+        self.filter_entry = ctk.CTkEntry(self.filter_frame, width=200)
+        self.filter_entry.pack(side="left", padx=5)
+        self.filter_entry.insert(0, "")
+        
+        self.filter_btn = ctk.CTkButton(self.filter_frame, text="Применить", 
+                                         command=self._apply_filter, width=100)
+        self.filter_btn.pack(side="left", padx=5)
+        
+        self.export_btn = ctk.CTkButton(self.filter_frame, text="Экспорт в файл", 
+                                         command=self._export_logs, width=120)
+        self.export_btn.pack(side="right", padx=5)
+    
+    def _create_menu(self):
+        """Создание меню"""
+        self.menubar = ctk.CTkFrame(self)
+        self.menubar.pack(fill="x")
+        
+        # Файл
+        file_menu = ctk.CTkButton(self.menubar, text="Файл", width=60, 
+                                   command=lambda: messagebox.showinfo("Файл", "Меню файла"))
+        file_menu.pack(side="left", padx=5, pady=5)
+        
+        # Настройки
+        settings_menu = ctk.CTkButton(self.menubar, text="Настройки", width=80,
+                                       command=self._show_settings)
+        settings_menu.pack(side="left", padx=5, pady=5)
+        
+        # О программе
+        about_menu = ctk.CTkButton(self.menubar, text="О программе", width=100,
+                                    command=self._show_about)
+        about_menu.pack(side="left", padx=5, pady=5)
+    
+    def _browse_folder(self):
+        """Выбор папки для сохранения"""
+        from tkinter import filedialog
+        folder = filedialog.askdirectory()
+        if folder:
+            self.folder_entry.delete(0, 'end')
+            self.folder_entry.insert(0, folder)
+    
+    def _toggle_connection(self):
+        """Подключение/отключение"""
+        if not self.is_connected:
+            self._connect()
+        else:
+            self._disconnect()
+    
+    def _connect(self):
+        """Подключение к RTT"""
+        host = self.host_entry.get()
+        try:
+            port = int(self.port_entry.get())
+        except ValueError:
+            messagebox.showerror("Ошибка", "Неверный номер порта!")
+            return
+        
+        self.stop_event.clear()
+        self.logger_thread = RTTLoggerThread(host, port, self._log_callback, self.stop_event)
+        self.logger_thread.start()
+        
+        self.is_connected = True
+        self.connect_btn.configure(text="Отключиться", fg_color="#E74C3C")
+        self.status_label.configure(text="Статус: Подключено", text_color="#2ECC71")
+        
+        # Создание файла лога
+        if self.autosave_var.get():
+            self._create_log_file()
+    
+    def _disconnect(self):
+        """Отключение от RTT"""
+        self.stop_event.set()
+        if self.logger_thread:
+            self.logger_thread.join(timeout=2.0)
+        
+        self.is_connected = False
+        self.connect_btn.configure(text="Подключиться", fg_color="#2ECC71")
+        self.status_label.configure(text="Статус: Отключено", text_color="#95A5A6")
+        
+        # Закрытие файла лога
+        if self.log_file:
             try:
-                self.file_handle.close()
-                print(f"\n[+] Файл сохранён: {self.log_file}")
+                self.log_file.close()
             except:
                 pass
-        print("[*] RTT Logger остановлен")
+            self.log_file = None
+    
+    def _create_log_file(self):
+        """Создание файла для сохранения логов"""
+        try:
+            output_dir = Path(self.folder_entry.get())
+            output_dir.mkdir(parents=True, exist_ok=True)
+            
+            if self.rotation_var.get():
+                date_str = datetime.now().strftime("%Y-%m-%d")
+                filename = f"RTT_log_{date_str}.txt"
+            else:
+                timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                filename = f"RTT_log_{timestamp}.txt"
+            
+            self.log_file = open(output_dir / filename, 'a', encoding='utf-8')
+            self.current_date = datetime.now().strftime("%Y-%m-%d")
+            
+        except Exception as e:
+            self._log_callback(f"[ERROR] Не удалось создать файл: {str(e)}", level='error')
+    
+    def _check_rotation(self):
+        """Проверка необходимости ротации"""
+        if not self.rotation_var.get() or not self.log_file:
+            return
+        
+        today = datetime.now().strftime("%Y-%m-%d")
+        if today != self.current_date:
+            # Закрываем старый файл и создаём новый
+            try:
+                self.log_file.close()
+            except:
+                pass
+            self._create_log_file()
+    
+    def _log_callback(self, line, level='default'):
+        """Обработка полученной строки лога (вызывается из потока)"""
+        # Планируем обновление GUI в главном потоке
+        self.after(0, lambda: self._update_gui(line, level))
+    
+    def _update_gui(self, line, level):
+        """Обновление GUI (в главном потоке)"""
+        # Применение фильтра
+        filter_text = self.filter_entry.get().strip()
+        if filter_text and filter_text.lower() not in line.lower():
+            return
+        
+        # Добавление в текстовое поле
+        self.log_text.configure(state='normal')
+        
+        # Определение уровня лога
+        if 'ERROR' in line or 'FATAL' in line or 'PANIC' in line:
+            tag = 'error'
+        elif 'WARN' in line:
+            tag = 'warn'
+        elif 'INFO' in line or 'OK' in line or 'SUCCESS' in line:
+            tag = 'info'
+        elif 'DEBUG' in line:
+            tag = 'debug'
+        else:
+            tag = 'default'
+        
+        # Вставка с временной меткой отдельно для цвета
+        if '] ' in line:
+            timestamp_part, message_part = line.split('] ', 1)
+            timestamp_part += '] '
+            self.log_text.insert('end', timestamp_part, 'timestamp')
+            self.log_text.insert('end', message_part + '\n', tag)
+        else:
+            self.log_text.insert('end', line + '\n', tag)
+        
+        # Автоскролл
+        self.log_text.see('end')
+        self.log_text.configure(state='disabled')
+        
+        # Сохранение в файл
+        if self.autosave_var.get() and self.log_file:
+            try:
+                self.log_file.write(line + '\n')
+                self.log_file.flush()
+            except:
+                pass
+        
+        # Обновление статистики
+        if self.logger_thread:
+            stats = self.logger_thread.stats
+            self.stats_label.configure(
+                text=f"Байт: {stats['bytes_received']:,} | Строк: {stats['lines_processed']:,}"
+            )
+        
+        # Проверка ротации
+        self._check_rotation()
+    
+    def _clear_logs(self):
+        """Очистка окна логов"""
+        self.log_text.configure(state='normal')
+        self.log_text.delete('1.0', 'end')
+        self.log_text.configure(state='disabled')
+    
+    def _apply_filter(self):
+        """Применение фильтра (просто очищает и перечитывает, если бы была история)"""
+        messagebox.showinfo("Фильтр", "Фильтр будет применён к новым сообщениям")
+    
+    def _export_logs(self):
+        """Экспорт логов в файл"""
+        from tkinter import filedialog
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+        )
+        
+        if file_path:
+            try:
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    self.log_text.configure(state='normal')
+                    content = self.log_text.get('1.0', 'end')
+                    # Удаление ANSI-кодов если есть
+                    content = re.sub(r'\x1b\[[0-9;]*m', '', content)
+                    f.write(content)
+                messagebox.showinfo("Экспорт", f"Логи экспортированы в:\n{file_path}")
+            except Exception as e:
+                messagebox.showerror("Ошибка", f"Не удалось экспортировать:\n{str(e)}")
+    
+    def _show_settings(self):
+        """Показ настроек"""
+        settings_window = ctk.CTkToplevel(self)
+        settings_window.title("Настройки")
+        settings_window.geometry("400x300")
+        
+        ctk.CTkLabel(settings_window, text="Настройки приложения", 
+                      font=("Arial", 16, "bold")).pack(pady=10)
+        
+        ctk.CTkLabel(settings_window, text="Здесь будут дополнительные настройки",
+                      text_color="gray").pack(pady=20)
+        
+        ctk.CTkButton(settings_window, text="Закрыть", 
+                       command=settings_window.destroy).pack(pady=10)
+    
+    def _show_about(self):
+        """Показ информации о программе"""
+        about_window = ctk.CTkToplevel(self)
+        about_window.title("О программе")
+        about_window.geometry("400x250")
+        
+        ctk.CTkLabel(about_window, text="J-Link RTT Auto Logger", 
+                      font=("Arial", 18, "bold")).pack(pady=10)
+        
+        ctk.CTkLabel(about_window, text="Версия 3.0", 
+                      text_color="gray").pack()
+        
+        info_text = """
+Графический интерфейс для чтения логов J-Link RTT
 
+Возможности:
+• Автоматическая ротация логов по дням
+• Умная буферизация данных
+• Цветовое выделение уровней логов
+• Автосохранение в файлы
+• Фильтрация логов
 
-def check_jlink_running(host='localhost', port=19021):
-    """Проверка, запущен ли JLink сервер"""
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(1)
-        result = sock.connect_ex((host, port))
-        sock.close()
-        return result == 0
-    except:
-        return False
+Разработано с помощью CustomTkinter
+"""
+        
+        ctk.CTkLabel(about_window, text=info_text, 
+                      justify="left").pack(pady=10, padx=10)
+        
+        ctk.CTkButton(about_window, text="Закрыть", 
+                       command=about_window.destroy).pack(pady=10)
+    
+    def _on_closing(self):
+        """Обработчик закрытия окна"""
+        if self.is_connected:
+            if messagebox.askyesno("Выход", "Подключение активно. Отключиться и выйти?"):
+                self._disconnect()
+                self.destroy()
+        else:
+            self.destroy()
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='RTT Auto Logger - Автоматическое сохранение логов J-Link RTT',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Примеры использования:
-  python rtt_auto_logger.py                         # С цветами, буферизацией и ротацией
-  python rtt_auto_logger.py --no-color              # Без цветового выделения
-  python rtt_auto_logger.py --no-rotation           # Без ротации (один файл)
-  python rtt_auto_logger.py --buffer-size 32768     # Изменить размер буфера
-  python rtt_auto_logger.py -d ./logs               # Сохранение в папку ./logs
-  python rtt_auto_logger.py -H 192.168.1.100        # Подключение к удалённому хосту
-
-Цветовое выделение:
-  - Красный:   ERROR, FATAL, CRITICAL, PANIC, FAIL
-  - Желтый:    WARN, WARNING
-  - Зеленый:   INFO, OK, SUCCESS, GOOD, READY
-  - Серый:     DEBUG, TRACE
-  - Голубой:   ON, OFF, ENABLE, DISABLE
-  - Фиолетовый: CHANGED, TRANSITION, SWITCH
-  - Циан:      Временные метки
-
-Имя файла будет создано автоматически в формате:
-  RTT_log_2026-01-15.txt (с ежедневной ротацией)
-  RTT_log_2026-01-15_14-23-45.txt (без ротации)
-        """
-    )
-    
-    parser.add_argument('-d', '--directory', 
-                       help='Папка для сохранения логов (по умолчанию: текущая папка)')
-    parser.add_argument('-H', '--host', default='localhost', 
-                       help='Хост J-Link сервера (по умолчанию: localhost)')
-    parser.add_argument('-p', '--port', type=int, default=19021,
-                       help='RTT Telnet порт (по умолчанию: 19021)')
-    parser.add_argument('--reconnect', action='store_true',
-                       help='Автоматическое переподключение при обрыве')
-    parser.add_argument('--no-rotation', action='store_true',
-                       help='Отключить ежедневную ротацию (один файл на весь сеанс)')
-    parser.add_argument('--buffer-size', type=int, default=65536,
-                       help='Максимальный размер буфера в байтах (по умолчанию: 65536)')
-    parser.add_argument('--no-color', action='store_true',
-                       help='Отключить цветовое выделение в консоли')
-    
-    args = parser.parse_args()
-    
-    print("="*60)
-    print("RTT Auto Logger v2.2")
-    print("С цветовой подсветкой, буферизацией и ротацией логов")
-    print("="*60)
-    print(f"Хост: {args.host}")
-    print(f"Порт RTT: {args.port}")
-    print(f"Ротация логов: {'ОТКЛ' if args.no_rotation else 'ВКЛ (ежедневно)'}")
-    print(f"Размер буфера: {args.buffer_size:,} байт")
-    print(f"Цветовое выделение: {'ОТКЛ' if args.no_color else 'ВКЛ'}")
-    if args.directory:
-        print(f"Папка сохранения: {args.directory}")
-    else:
-        print(f"Папка сохранения: {Path.cwd()}")
-    print("="*60)
-    
-    # Проверка существования папки
-    if args.directory:
-        output_dir = Path(args.directory)
-        output_dir.mkdir(parents=True, exist_ok=True)
-    else:
-        output_dir = Path.cwd()
-    
-    # Проверка подключения
-    if not check_jlink_running(args.host, args.port):
-        print(f"\n[-] Не удалось подключиться к порту {args.port}")
-        print("[!] Убедитесь, что JLinkGDBServer запущен")
-        print("\n[?] Попытка подключения через 5 секунд...")
-        time.sleep(5)
-        
-        if not check_jlink_running(args.host, args.port):
-            print("[-] Подключение не удалось. Завершение программы.")
-            sys.exit(1)
-    
-    # Создание логгера
-    logger = RTTAutoLogger(
-        host=args.host,
-        rtt_port=args.port,
-        output_dir=output_dir,
-        rotate_daily=not args.no_rotation,
-        max_buffer_size=args.buffer_size,
-        color_enabled=not args.no_color
-    )
-    
-    # Запуск с автопереподключением если нужно
-    if args.reconnect:
-        print("[*] Режим автоматического переподключения активирован\n")
-        reconnect_count = 0
-        while True:
-            reconnect_count += 1
-            print(f"\n{'='*60}")
-            print(f"Попытка подключения #{reconnect_count}")
-            print(f"{'='*60}\n")
-            logger.start()
-            print("\n[*] Переподключение через 5 секунд...")
-            time.sleep(5)
-            logger = RTTAutoLogger(
-                host=args.host,
-                rtt_port=args.port,
-                output_dir=output_dir,
-                rotate_daily=not args.no_rotation,
-                max_buffer_size=args.buffer_size,
-                color_enabled=not args.no_color
-            )
-    else:
-        logger.start()
+    app = RTTLoggerGUI()
+    app.mainloop()
 
 
 if __name__ == '__main__':
+    # Установка темы
+    ctk.set_appearance_mode("dark")  # "light" или "dark"
+    ctk.set_default_color_theme("blue")  # "blue", "green", "dark-blue"
+    
     main()
