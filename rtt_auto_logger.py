@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-RTT Auto Logger - С фильтрацией управляющих символов
+RTT Auto Logger - Автоматическое чтение и сохранение логов J-Link RTT
+С функцией автоматической ротации логов по дням
 Работает на Windows и Linux
 """
 
@@ -9,58 +10,64 @@ import socket
 import time
 import argparse
 import sys
-import re
 from datetime import datetime
 from pathlib import Path
 
 class RTTAutoLogger:
     def __init__(self, host='localhost', rtt_port=19021, output_dir=None, 
-                 filter_control_chars=True, show_hex=False):
+                 rotate_daily=True):
         self.host = host
         self.rtt_port = rtt_port
         self.output_dir = output_dir or Path.cwd()
+        self.rotate_daily = rotate_daily
         self.running = False
         self.socket = None
         self.file_handle = None
         self.log_file = None
-        self.filter_control_chars = filter_control_chars
-        self.show_hex = show_hex
-        
-        # Паттерн для удаления управляющих символов (кроме \n, \r, \t)
-        self.control_char_pattern = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
+        self.current_date = None  # Отслеживаем текущую дату для ротации
         
     def get_timestamp(self):
         """Возвращает текущую временную метку"""
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     
-    def clean_line(self, line):
-        """Очистка строки от управляющих символов"""
-        if not self.filter_control_chars:
-            return line
-        
-        # Удаляем управляющие символы
-        cleaned = self.control_char_pattern.sub('', line)
-        
-        # Заменяем множественные пробелы на один (опционально)
-        # cleaned = re.sub(r' {2,}', ' ', cleaned)
-        
-        return cleaned
-    
-    def decode_data(self, data):
-        """Декодирование данных с обработкой ошибок"""
-        # Пытаемся декодировать как UTF-8
-        try:
-            return data.decode('utf-8', errors='replace')
-        except Exception:
-            return data.decode('latin-1', errors='replace')
+    def get_today_string(self):
+        """Возвращает строку с текущей датой (YYYY-MM-DD)"""
+        return datetime.now().strftime("%Y-%m-%d")
     
     def create_log_filename(self):
         """Создаёт имя файла с датой и временем запуска"""
         now = datetime.now()
         date_str = now.strftime("%Y-%m-%d")
         time_str = now.strftime("%H-%M-%S")
-        filename = f"RTT_log_{date_str}_{time_str}.txt"
+        
+        if self.rotate_daily:
+            # При ежедневной ротации имя файла содержит только дату
+            filename = f"RTT_log_{date_str}.txt"
+        else:
+            # Без ротации - дата и время запуска
+            filename = f"RTT_log_{date_str}_{time_str}.txt"
+        
         return Path(self.output_dir) / filename
+    
+    def check_and_rotate_log(self):
+        """Проверяет, не сменился ли день, и создаёт новый файл при необходимости"""
+        if not self.rotate_daily:
+            return
+        
+        today = self.get_today_string()
+        
+        # Если дата изменилась, закрываем старый файл и создаём новый
+        if self.current_date != today:
+            if self.file_handle:
+                try:
+                    old_file = self.log_file
+                    self.file_handle.close()
+                    print(f"\n[✓] Предыдущий лог сохранён: {old_file}")
+                except Exception as e:
+                    print(f"[-] Ошибка при закрытии файла: {e}")
+            
+            self.current_date = today
+            self.open_log_file()
     
     def connect_rtt_telnet(self):
         """Подключение к RTT через Telnet (порт 19021)"""
@@ -79,11 +86,8 @@ class RTTAutoLogger:
         """Открывает файл лога с автоматическим именем"""
         self.log_file = self.create_log_filename()
         try:
-            self.file_handle = open(self.log_file, 'w', encoding='utf-8')
-            print(f"[+] Файл лога создан: {self.log_file}")
-            print(f"[*] Логи автоматически сохраняются в реальном времени")
-            if self.filter_control_chars:
-                print(f"[*] Фильтрация управляющих символов: ВКЛ")
+            self.file_handle = open(self.log_file, 'a', encoding='utf-8')
+            print(f"[+] Файл лога: {self.log_file}")
             return True
         except Exception as e:
             print(f"[-] Ошибка создания файла: {e}")
@@ -93,17 +97,23 @@ class RTTAutoLogger:
         """Чтение данных из Telnet соединения"""
         buffer = b''
         line_count = 0
+        last_rotation_check = time.time()
         
         while self.running:
             try:
+                # Проверяем необходимость ротации каждые 60 секунд
+                current_time = time.time()
+                if current_time - last_rotation_check >= 60:
+                    self.check_and_rotate_log()
+                    last_rotation_check = current_time
+                
                 data = self.socket.recv(4096)
                 if data:
                     buffer += data
                     # Обрабатываем полные строки
                     while b'\n' in buffer:
                         line, buffer = buffer.split(b'\n', 1)
-                        line_str = self.decode_data(line)
-                        line_str = line_str.strip()
+                        line_str = line.decode('utf-8', errors='replace').strip()
                         if line_str:
                             self.process_line(line_str)
                             line_count += 1
@@ -122,11 +132,7 @@ class RTTAutoLogger:
     def process_line(self, line):
         """Обработка строки лога с временной меткой"""
         timestamp = self.get_timestamp()
-        
-        # Очистка от управляющих символов
-        cleaned_line = self.clean_line(line)
-        
-        timestamped_line = f"[{timestamp}] {cleaned_line}"
+        timestamped_line = f"[{timestamp}] {line}"
         
         # Вывод в консоль
         print(timestamped_line)
@@ -135,13 +141,14 @@ class RTTAutoLogger:
         if self.file_handle:
             try:
                 self.file_handle.write(timestamped_line + '\n')
-                self.file_handle.flush()
+                self.file_handle.flush()  # Гарантируем запись на диск
             except Exception as e:
                 print(f"[-] Ошибка записи в файл: {e}")
     
     def start(self):
         """Запуск логгера"""
         self.running = True
+        self.current_date = self.get_today_string()
         
         # Подключение к RTT
         if not self.connect_rtt_telnet():
@@ -152,6 +159,9 @@ class RTTAutoLogger:
         # Создание файла лога
         if not self.open_log_file():
             return False
+        
+        if self.rotate_daily:
+            print(f"[*] Ежедневная ротация логов: ВКЛ")
         
         print("\n" + "="*60)
         print("[*] Чтение RTT логов началось")
@@ -200,13 +210,14 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Примеры использования:
-  python rtt_auto_logger.py                    # С фильтрацией управляющих символов
-  python rtt_auto_logger.py --no-filter        # Без фильтрации (сырые данные)
+  python rtt_auto_logger.py                    # С ежедневной ротацией
+  python rtt_auto_logger.py --no-rotation      # Без ротации (один файл)
   python rtt_auto_logger.py -d ./logs          # Сохранение в папку ./logs
   python rtt_auto_logger.py -H 192.168.1.100   # Подключение к удалённому хосту
 
 Имя файла будет создано автоматически в формате:
-  RTT_log_2026-01-15_14-23-45.txt
+  RTT_log_2026-01-15.txt (с ежедневной ротацией)
+  RTT_log_2026-01-15_14-23-45.txt (без ротации)
         """
     )
     
@@ -218,18 +229,18 @@ def main():
                        help='RTT Telnet порт (по умолчанию: 19021)')
     parser.add_argument('--reconnect', action='store_true',
                        help='Автоматическое переподключение при обрыве')
-    parser.add_argument('--no-filter', action='store_true',
-                       help='Не фильтровать управляющие символы (показывать сырые данные)')
+    parser.add_argument('--no-rotation', action='store_true',
+                       help='Отключить ежедневную ротацию (один файл на весь сеанс)')
     
     args = parser.parse_args()
     
     print("="*60)
-    print("RTT Auto Logger v1.1")
+    print("RTT Auto Logger v2.0")
     print("Автоматическое сохранение логов с временными метками")
     print("="*60)
     print(f"Хост: {args.host}")
     print(f"Порт RTT: {args.port}")
-    print(f"Фильтрация символов: {'ВЫКЛ' if args.no_filter else 'ВКЛ'}")
+    print(f"Ротация логов: {'ОТКЛ' if args.no_rotation else 'ВКЛ (ежедневно)'}")
     if args.directory:
         print(f"Папка сохранения: {args.directory}")
     else:
@@ -259,7 +270,7 @@ def main():
         host=args.host,
         rtt_port=args.port,
         output_dir=output_dir,
-        filter_control_chars=not args.no_filter
+        rotate_daily=not args.no_rotation
     )
     
     # Запуск с автопереподключением если нужно
@@ -278,7 +289,7 @@ def main():
                 host=args.host,
                 rtt_port=args.port,
                 output_dir=output_dir,
-                filter_control_chars=not args.no_filter
+                rotate_daily=not args.no_rotation
             )
     else:
         logger.start()
